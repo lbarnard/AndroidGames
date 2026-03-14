@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"require\\(''fs''\\).writeFileSync\\(''C:\\\\\\\\Users\\\\\\\\leeba\\\\\\\\claude-game-demo\\\\\\\\test.txt'',''hello''\\)\")",
+      "Bash(node -e:*)",
+      "Bash(/c/Python312/python:*)",
+      "Bash(printf:*)"
+    ]
+  }
+}

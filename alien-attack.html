@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Alien Attack</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box }
+body { background:#020208; overflow:hidden }
+canvas { display:block }
+#ui {
+  position:fixed; top:0; left:0; width:100%;
+  pointer-events:none; font-family:monospace; font-size:14px;
+  display:flex; justify-content:space-between; padding:10px 20px;
+  color:#0ff; text-shadow:0 0 8px #0ff; letter-spacing:2px;
+}
+#msg {
+  position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+  font-family:monospace; text-align:center; display:none;
+  color:#0ff; text-shadow:0 0 20px #0ff;
+}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <span id="uiHp"></span>
+  <span id="uiLvl">LEVEL 1</span>
+  <span id="uiScore">0</span>
+</div>
+<div id="msg"></div>
+
+<script>'use strict';
+
+const C   = document.getElementById('c');
+const ctx = C.getContext('2d');
+function resize() { C.width = innerWidth; C.height = innerHeight; }
+resize(); window.addEventListener('resize', resize);
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+let actx;
+function AC() { return actx || (actx = new AudioContext()); }
+
+function beep(f, dur, type='square', vol=0.12) {
+  const a=AC(), o=a.createOscillator(), g=a.createGain();
+  o.type=type; o.frequency.value=f;
+  g.gain.setValueAtTime(vol, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(); o.stop(a.currentTime+dur);
+}
+function boom(vol=0.25) {
+  const a=AC(), sr=a.sampleRate, dur=0.25;
+  const buf=a.createBuffer(1, sr*dur, sr), d=buf.getChannelData(0);
+  for (let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*Math.exp(-i/(sr*0.04));
+  const src=a.createBufferSource(), lp=a.createBiquadFilter(), g=a.createGain();
+  lp.frequency.value=400; src.buffer=buf;
+  g.gain.setValueAtTime(vol, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur);
+  src.connect(lp); lp.connect(g); g.connect(a.destination); src.start();
+}
+const SFX = {
+  shoot:     () => beep(900, 0.07, 'square', 0.08),
+  alienShoot:() => beep(220, 0.12, 'sawtooth', 0.08),
+  hitAlien:  () => beep(300, 0.08, 'sawtooth', 0.1),
+  alienDie:  () => { beep(150, 0.3, 'sawtooth', 0.15); boom(0.2); },
+  playerHit: () => { beep(100, 0.4, 'sawtooth', 0.25); },
+  jump:      () => beep(350, 0.1, 'sine', 0.08),
+  levelWin:  () => [440,550,660,880].forEach((f,i)=>setTimeout(()=>beep(f,0.25,'sine',0.18),i*120)),
+};
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+const K = {};
+window.addEventListener('keydown', e => {
+  K[e.code] = true; AC();
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { K[e.code] = false; });
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const TS     = 40;    // tile size px
+const COLS   = 80;    // level width in tiles
+const ROWS   = 14;    // level height in tiles (560px — fits most screens)
+const LW     = COLS * TS;  // level world width
+const LH     = ROWS * TS;  // level world height
+const GRAV   = 880;
+const PSPD   = 185;
+const JSPD   = 430;
+const PW     = 18;
+const PH     = 26;
+const FIRE_RATE = 0.10;  // player shots per second gate
+const T = { EMPTY:0, SOLID:1, PLAT:2 };
+
+// ── Stars ─────────────────────────────────────────────────────────────────────
+const STARS = Array.from({length:220}, ()=>({
+  x: Math.random()*LW, y: Math.random()*3000,  // taller than any screen
+  r: Math.random()*1.4+0.3, a: Math.random()*0.7+0.2,
+}));
+
+// ── Level Generator ───────────────────────────────────────────────────────────
+// Builds each level programmatically — guaranteed correct geometry.
+// Layout (ROWS=14, TS=40 → 560px tall):
+//   Row  0      : solid top border
+//   Rows 1-3    : open sky (floaters live here)
+//   Row  4      : high one-way platforms
+//   Rows 5-6    : open mid-high
+//   Row  7      : low one-way platforms
+//   Rows 8-9    : open mid-low
+//   Row 10      : ground enemy layer (walkers / spitters stand here)
+//   Rows 11-12  : solid ground
+//   Row  13     : solid bottom border
+
+function createLevel(n) {
+  const tiles  = Array.from({length:ROWS}, ()=>Array(COLS).fill(T.EMPTY));
+  const spawns = [];
+
+  // Border
+  for (let c=0;c<COLS;c++) { tiles[0][c]=T.SOLID; tiles[ROWS-1][c]=T.SOLID; }
+  for (let r=0;r<ROWS;r++)  { tiles[r][0]=T.SOLID; tiles[r][COLS-1]=T.SOLID; }
+
+  // Solid ground
+  for (let c=1;c<COLS-1;c++) { tiles[11][c]=T.SOLID; tiles[12][c]=T.SOLID; }
+
+  // One-way platforms — denser each level
+  const platW   = [7, 6, 5][n];     // platform tile width
+  const platGap = [13, 11, 9][n];   // gap between platform starts
+  for (let c=4; c<COLS-5; c+=platGap) {
+    for (let i=0; i<platW && c+i<COLS-1; i++) tiles[4][c+i] = T.PLAT; // high
+    for (let i=0; i<platW && c+i<COLS-1; i++) tiles[7][c+i] = T.PLAT; // mid
+  }
+
+  // Enemy config per level (step = tiles between spawns)
+  const wStep = [6, 4, 3][n];    // walkers
+  const fStep = [9, 6, 4][n];    // floaters
+  const sStep = [11, 8, 6][n];   // spitters
+
+  const GY = 11*TS - PH;    // ground standing y (feet on row 11)
+  const MY = 7*TS  - PH;    // mid-platform standing y
+  const HY = 4*TS  - PH;    // high-platform standing y
+
+  // Walkers — ground
+  for (let c=3; c<COLS-2; c+=wStep)
+    spawns.push({type:1, x:c*TS, y:GY});
+  // Walkers — mid platforms
+  for (let c=5; c<COLS-4; c+=wStep+2)
+    spawns.push({type:1, x:c*TS, y:MY});
+
+  // Floaters — scattered across sky rows 2–5
+  for (let c=4; c<COLS-3; c+=fStep)
+    spawns.push({type:2, x:c*TS, y:(2 + (c%3))*TS});
+
+  // Spitters — ground
+  for (let c=6; c<COLS-2; c+=sStep)
+    spawns.push({type:3, x:c*TS, y:GY});
+  // Spitters — high platforms
+  for (let c=7; c<COLS-4; c+=sStep+4)
+    spawns.push({type:3, x:c*TS, y:HY});
+
+  return {
+    tiles, spawns,
+    spawnX: 2*TS, spawnY: GY,
+    exitX: (COLS-3)*TS + TS/2, exitY: 11*TS,
+  };
+}
+
+// ── Tile Helpers ──────────────────────────────────────────────────────────────
+function getTile(tiles, c, r) {
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return T.SOLID;
+  return tiles[r][c];
+}
+function isSolid(tiles, c, r) {
+  return getTile(tiles, c, r) === T.SOLID;
+}
+function isPlat(tiles, c, r) {
+  return getTile(tiles, c, r) === T.PLAT;
+}
+
+// ── AABB Physics ──────────────────────────────────────────────────────────────
+// Move obj (with .x .y .vx .vy) by (dx, dy), resolve tile collisions.
+// Returns {grounded, hitCeil, hitWall}
+function moveAndResolve(obj, w, h, tiles, dy, isPlatformSolid) {
+  let grounded = false, hitCeil = false, hitWall = false;
+
+  // ─ Horizontal ─
+  obj.x += obj.vx * (1/60); // approximate; caller passes actual dx via vx
+  // (caller sets obj.vx before calling; we step by vx*dt separately — see updateEntity)
+
+  // ─ Vertical ─
+  const prevBottom = obj.y + h;
+  obj.y += dy;
+
+  const c1 = Math.floor(obj.x / TS);
+  const c2 = Math.floor((obj.x + w - 1) / TS);
+  const rTop    = Math.floor(obj.y / TS);
+  const rBottom = Math.floor((obj.y + h - 1) / TS);
+
+  // Ceiling
+  if (isSolid(tiles, c1, rTop) || isSolid(tiles, c2, rTop)) {
+    obj.y = (rTop + 1) * TS;
+    obj.vy = Math.max(0, obj.vy);
+    hitCeil = true;
+  }
+  // Floor
+  if (obj.vy >= 0) {
+    if (isSolid(tiles, c1, rBottom) || isSolid(tiles, c2, rBottom)) {
+      obj.y = rBottom * TS - h;
+      obj.vy = 0;
+      grounded = true;
+    } else if (isPlatformSolid &&
+               (isPlat(tiles, c1, rBottom) || isPlat(tiles, c2, rBottom)) &&
+               prevBottom <= rBottom * TS + 2) {
+      obj.y = rBottom * TS - h;
+      obj.vy = 0;
+      grounded = true;
+    }
+  }
+  return { grounded, hitCeil, hitWall };
+}
+
+function moveX(obj, w, h, dx, tiles) {
+  obj.x += dx;
+  const c1 = Math.floor(obj.x / TS);
+  const c2 = Math.floor((obj.x + w - 1) / TS);
+  const rTop    = Math.floor(obj.y / TS);
+  const rBottom = Math.floor((obj.y + h - 1) / TS);
+  let hit = false;
+  if (isSolid(tiles, c1, rTop) || isSolid(tiles, c1, rBottom)) {
+    obj.x = (c1 + 1) * TS; hit = true;
+  }
+  if (isSolid(tiles, c2, rTop) || isSolid(tiles, c2, rBottom)) {
+    obj.x = c2 * TS - w; hit = true;
+  }
+  return hit;
+}
+
+// ── Game State ────────────────────────────────────────────────────────────────
+let phase = 'start';
+let levelIdx = 0;
+let score = 0;
+let lives = 3;
+let levelData, tiles;
+let player, aliens, pBullets, aBullets, particles;
+let camX = 0, camY = 0;
+let shakeAmt = 0;
+
+// ── Particle Factory ──────────────────────────────────────────────────────────
+function spawnParticles(x, y, color, n=12) {
+  for (let i=0; i<n; i++) {
+    const angle = (Math.PI*2/n)*i + Math.random()*0.4;
+    const spd   = 60 + Math.random()*200;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle)*spd, vy: Math.sin(angle)*spd - 80,
+      life: 0.5+Math.random()*0.4, maxLife: 1,
+      color, size: 2+Math.random()*3,
+    });
+  }
+}
+
+// ── Load Level ────────────────────────────────────────────────────────────────
+function loadLevel(n) {
+  levelData = createLevel(n);
+  tiles = levelData.tiles;
+  pBullets  = [];
+  aBullets  = [];
+  particles = [];
+  shakeAmt  = 0;
+
+  player = {
+    x: levelData.spawnX, y: levelData.spawnY,
+    vx: 0, vy: 0, dir: 1,
+    hp: 3, maxHp: 3,
+    grounded: false,
+    coyote: 0, jumpBuf: 0,
+    fireCool: 0,
+    invincible: 0,
+    frame: 0, frameT: 0,
+    dead: false,
+  };
+
+  aliens = levelData.spawns.map(s => ({
+    type: s.type, x: s.x, y: s.y,
+    vx: 0, vy: 0,
+    hp: [0, 2, 3, 4][s.type],  // type→hp
+    dir: 1,
+    grounded: false,
+    fireCool: Math.random() * 2,
+    spawnX: s.x, spawnY: s.y,
+    alive: true,
+    frame: 0, frameT: 0,
+    hoverBase: s.y,   // for floaters
+  }));
+
+  document.getElementById('uiLvl').textContent = `LEVEL ${n+1}`;
+  camX = 0; camY = 0;
+}
+
+// ── Update Player ─────────────────────────────────────────────────────────────
+function updatePlayer(dt) {
+  const p = player;
+  if (p.dead) return;
+
+  p.frameT += dt;
+  if (p.frameT > 0.1) { p.frame = (p.frame+1)%4; p.frameT=0; }
+
+  // Invincibility
+  if (p.invincible > 0) p.invincible -= dt;
+
+  // Horizontal movement
+  let moving = false;
+  if (K.ArrowLeft || K.KeyA)  { p.vx = -PSPD; p.dir = -1; moving = true; }
+  else if (K.ArrowRight || K.KeyD) { p.vx = PSPD; p.dir = 1; moving = true; }
+  else p.vx *= 0.75;
+
+  // Gravity
+  p.vy += GRAV * dt;
+
+  // Coyote time
+  if (p.grounded) p.coyote = 0.1;
+  else p.coyote -= dt;
+
+  // Jump buffer
+  if (K.ArrowUp || K.KeyW || K.Space) p.jumpBuf = 0.12;
+  else p.jumpBuf -= dt;
+
+  // Jump
+  if (p.jumpBuf > 0 && p.coyote > 0) {
+    p.vy = -JSPD;
+    p.coyote = 0; p.jumpBuf = 0;
+    SFX.jump();
+  }
+  // Variable jump height
+  if (!(K.ArrowUp || K.KeyW || K.Space) && p.vy < -200) p.vy += 60;
+
+  // Move X
+  const hitWall = moveX(p, PW, PH, p.vx * dt, tiles);
+  if (hitWall) p.vx = 0;
+
+  // Move Y
+  const prevBottom = p.y + PH;
+  p.y += p.vy * dt;
+  const c1 = Math.floor(p.x / TS), c2 = Math.floor((p.x+PW-1)/TS);
+  const rTop = Math.floor(p.y/TS), rBot = Math.floor((p.y+PH-1)/TS);
+  p.grounded = false;
+  if (isSolid(tiles, c1, rTop) || isSolid(tiles, c2, rTop)) {
+    p.y = (rTop+1)*TS; p.vy = Math.max(0, p.vy);
+  }
+  if (p.vy >= 0) {
+    if (isSolid(tiles, c1, rBot) || isSolid(tiles, c2, rBot)) {
+      p.y = rBot*TS - PH; p.vy = 0; p.grounded = true;
+    } else if (isPlat(tiles, c1, rBot) || isPlat(tiles, c2, rBot)) {
+      if (prevBottom <= rBot*TS + 2) {
+        p.y = rBot*TS - PH; p.vy = 0; p.grounded = true;
+      }
+    }
+  }
+  // Clamp to world
+  p.x = Math.max(0, Math.min(LW - PW, p.x));
+  if (p.y > LH) { p.hp = 0; }
+
+  // Shooting — 4 directions (Contra style)
+  p.fireCool -= dt;
+  const shooting = K.KeyZ || K.KeyX || K.ShiftLeft || K.ShiftRight || K.ControlLeft;
+  if (shooting && p.fireCool <= 0) {
+    p.fireCool = FIRE_RATE;
+    const shootUp = K.ArrowUp || K.KeyW;
+    const bvx = shootUp ? 0 : p.dir * 580;
+    const bvy = shootUp ? -580 : 0;
+    const bx  = shootUp ? p.x + PW/2 - 2 : p.x + (p.dir > 0 ? PW : -12);
+    const by  = shootUp ? p.y : p.y + PH*0.35;
+    pBullets.push({ x: bx, y: by, vx: bvx, vy: bvy, alive: true, w: shootUp ? 4 : 10, h: shootUp ? 10 : 4 });
+    SFX.shoot();
+  }
+
+  // Exit check
+  const ex = levelData.exitX, ey = levelData.exitY;
+  if (Math.abs((p.x+PW/2)-ex) < 30 && Math.abs((p.y+PH)-ey) < 40) {
+    winLevel();
+  }
+
+  // Death
+  if (p.hp <= 0 && !p.dead) {
+    p.dead = true;
+    spawnParticles(p.x+PW/2, p.y+PH/2, '#0ff', 20);
+    shakeAmt = 0.4;
+    boom(0.4);
+    setTimeout(onPlayerDead, 1200);
+  }
+}
+
+// ── Update Aliens ─────────────────────────────────────────────────────────────
+function updateAliens(dt) {
+  const p = player;
+  for (const a of aliens) {
+    if (!a.alive) continue;
+    a.frameT += dt; if (a.frameT > 0.15) { a.frame=(a.frame+1)%4; a.frameT=0; }
+
+    const px = p.x + PW/2, py = p.y + PH/2;
+    const ax = a.x + 9,    ay = a.y + PH/2;
+    const dx = px - ax,    dy = py - ay;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    if (a.type === 1) {
+      // Walker: patrol, reverse at edges/walls, shoot horizontally
+      a.vx = a.dir * 65;
+      a.vy += GRAV * dt;
+
+      const hitW = moveX(a, 18, PH, a.vx * dt, tiles);
+      if (hitW) a.dir *= -1;
+
+      const prevBot = a.y + PH;
+      a.y += a.vy * dt;
+      const c1=Math.floor(a.x/TS), c2=Math.floor((a.x+17)/TS);
+      const rBot=Math.floor((a.y+PH-1)/TS);
+      a.grounded=false;
+      if (isSolid(tiles,c1,rBot)||isSolid(tiles,c2,rBot)) {
+        a.y=rBot*TS-PH; a.vy=0; a.grounded=true;
+      } else if (isPlat(tiles,c1,rBot)||isPlat(tiles,c2,rBot)) {
+        if (prevBot<=rBot*TS+2) { a.y=rBot*TS-PH; a.vy=0; a.grounded=true; }
+      }
+      // Reverse at platform edge
+      if (a.grounded) {
+        const ahead = Math.floor((a.x + (a.dir>0?18:0) + a.dir*2) / TS);
+        const below = Math.floor((a.y + PH + 2) / TS);
+        if (!isSolid(tiles, ahead, below) && !isPlat(tiles, ahead, below)) a.dir *= -1;
+      }
+      // Face player
+      if (dx !== 0) a.dir = Math.sign(dx);
+
+      a.fireCool -= dt;
+      if (a.fireCool <= 0 && dist < 600) {
+        a.fireCool = 2.2 + Math.random()*0.6;
+        aBullets.push({ x:ax, y:ay-2, vx:a.dir*150, vy:-20, alive:true, w:8, h:4 });
+        SFX.alienShoot();
+      }
+
+    } else if (a.type === 2) {
+      // Floater: hover and seek player
+      const targetY = py - 60;
+      const hoverDiff = targetY - ay;
+      a.vy += (hoverDiff * 4 - a.vy) * Math.min(1, dt * 3);
+      a.vx += (dx * 0.5 - a.vx) * Math.min(1, dt * 1.5);
+      a.vx = Math.max(-90, Math.min(90, a.vx));
+      a.vy = Math.max(-120, Math.min(120, a.vy));
+
+      a.x += a.vx * dt;
+      a.y += a.vy * dt;
+      a.x = Math.max(TS, Math.min(LW-TS-18, a.x));
+      a.y = Math.max(TS, Math.min(LH-TS-PH, a.y));
+
+      a.fireCool -= dt;
+      if (a.fireCool <= 0 && dist < 500) {
+        a.fireCool = 1.8 + Math.random()*0.5;
+        const spd = 170;
+        const ang = Math.atan2(dy, dx);
+        aBullets.push({ x:ax, y:ay, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, alive:true, w:8, h:8 });
+        SFX.alienShoot();
+      }
+
+    } else if (a.type === 3) {
+      // Spitter: stationary, rapid aimed fire
+      a.vy += GRAV * dt;
+      a.y += a.vy * dt;
+      const rBot=Math.floor((a.y+PH-1)/TS);
+      const c1=Math.floor(a.x/TS), c2=Math.floor((a.x+17)/TS);
+      if (isSolid(tiles,c1,rBot)||isSolid(tiles,c2,rBot)) { a.y=rBot*TS-PH; a.vy=0; }
+
+      a.fireCool -= dt;
+      if (a.fireCool <= 0 && dist < 700) {
+        a.fireCool = 1.0 + Math.random()*0.4;
+        const spd = 240;
+        const ang = Math.atan2(dy, dx);
+        aBullets.push({ x:ax, y:ay, vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, alive:true, w:7, h:7 });
+        SFX.alienShoot();
+      }
+    }
+
+    // Player–alien contact damage
+    if (p.invincible <= 0 && !p.dead) {
+      if (p.x < a.x+18 && p.x+PW > a.x && p.y < a.y+PH && p.y+PH > a.y) {
+        p.hp--;
+        p.invincible = 1.2;
+        p.vy = -300;
+        shakeAmt = 0.25;
+        SFX.playerHit();
+      }
+    }
+  }
+}
+
+// ── Update Bullets ────────────────────────────────────────────────────────────
+function updateBullets(dt) {
+  const p = player;
+
+  // Player bullets
+  for (const b of pBullets) {
+    if (!b.alive) continue;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.x < 0 || b.x > LW || b.y < 0 || b.y > LH) { b.alive=false; continue; }
+    // Tile collision
+    if (isSolid(tiles, Math.floor(b.x/TS), Math.floor(b.y/TS))) {
+      b.alive=false;
+      spawnParticles(b.x, b.y, '#0ff', 4);
+      continue;
+    }
+    // Alien collision
+    for (const a of aliens) {
+      if (!a.alive) continue;
+      if (b.x < a.x+18 && b.x+b.w > a.x && b.y < a.y+PH && b.y+b.h > a.y) {
+        b.alive = false;
+        a.hp--;
+        SFX.hitAlien();
+        spawnParticles(b.x, b.y, '#0f8', 5);
+        if (a.hp <= 0) {
+          a.alive = false;
+          score += [0, 100, 150, 200][a.type];
+          shakeAmt = Math.max(shakeAmt, 0.1);
+          SFX.alienDie();
+          spawnParticles(a.x+9, a.y+PH/2, a.type===1?'#0f0':a.type===2?'#a0f':'#f40', 16);
+          document.getElementById('uiScore').textContent = score;
+        }
+        break;
+      }
+    }
+  }
+
+  // Alien bullets
+  for (const b of aBullets) {
+    if (!b.alive) continue;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.x < 0 || b.x > LW || b.y < 0 || b.y > LH) { b.alive=false; continue; }
+    if (isSolid(tiles, Math.floor(b.x/TS), Math.floor(b.y/TS))) {
+      b.alive=false;
+      spawnParticles(b.x, b.y, '#f40', 3);
+      continue;
+    }
+    // Hit player
+    if (p.invincible <= 0 && !p.dead) {
+      if (b.x < p.x+PW && b.x+b.w > p.x && b.y < p.y+PH && b.y+b.h > p.y) {
+        b.alive = false;
+        p.hp--;
+        p.invincible = 1.0;
+        shakeAmt = 0.2;
+        SFX.playerHit();
+        spawnParticles(b.x, b.y, '#f80', 6);
+      }
+    }
+  }
+
+  // Prune dead bullets
+  if (pBullets.length > 100) pBullets.splice(0, pBullets.length - 100);
+  if (aBullets.length > 120) aBullets.splice(0, aBullets.length - 120);
+}
+
+// ── Update Particles ──────────────────────────────────────────────────────────
+function updateParticles(dt) {
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 300 * dt;
+    p.life -= dt;
+  }
+  for (let i = particles.length-1; i>=0; i--) {
+    if (particles[i].life <= 0) particles.splice(i,1);
+  }
+}
+
+// ── Camera ────────────────────────────────────────────────────────────────────
+function updateCamera() {
+  const p = player;
+  const tx = p.x + PW/2 - C.width/2;
+  camX += (tx - camX) * 0.12;
+  camX = Math.max(0, Math.min(LW - C.width, camX));
+  // camY is fixed — level is pinned to bottom of screen (see wy())
+
+  if (shakeAmt > 0) {
+    camX += (Math.random()-0.5) * shakeAmt * 18;
+    shakeAmt -= 0.02;
+    if (shakeAmt < 0) shakeAmt = 0;
+  }
+}
+
+// ── Drawing Helpers ───────────────────────────────────────────────────────────
+function glow(color, blur) {
+  ctx.shadowColor = color; ctx.shadowBlur = blur;
+  ctx.fillStyle   = color; ctx.strokeStyle = color;
+}
+function clearGlow() { ctx.shadowBlur = 0; }
+
+function wx(x) { return Math.round(x - camX); }
+// Level sits flush at the bottom of the screen; sky fills the space above
+function levelTop() { return Math.max(0, C.height - LH); }
+function wy(y) { return Math.round(y + levelTop()); }
+
+// ── Draw Tiles ────────────────────────────────────────────────────────────────
+function drawTiles() {
+  const c0 = Math.floor(camX / TS), c1 = Math.ceil((camX + C.width)  / TS);
+  const r0 = Math.floor(camY / TS), r1 = Math.ceil((camY + C.height) / TS);
+
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      const t = getTile(tiles, c, r);
+      if (t === T.EMPTY) continue;
+      const sx = wx(c*TS), sy = wy(r*TS);
+
+      if (t === T.SOLID) {
+        // Dark metallic panel with neon edge
+        ctx.fillStyle = '#0d1a2a';
+        ctx.fillRect(sx, sy, TS, TS);
+        ctx.strokeStyle = '#1a4a6a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx+0.5, sy+0.5, TS-1, TS-1);
+        // Accent grill lines
+        ctx.strokeStyle = '#0a2535';
+        ctx.lineWidth = 1;
+        for (let i=8; i<TS; i+=8) {
+          ctx.beginPath(); ctx.moveTo(sx, sy+i); ctx.lineTo(sx+TS, sy+i); ctx.stroke();
+        }
+        // Neon top edge
+        ctx.strokeStyle = '#1e6e9e';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(sx, sy+1); ctx.lineTo(sx+TS, sy+1); ctx.stroke();
+      } else if (t === T.PLAT) {
+        // One-way platform: thin glowing bar
+        ctx.fillStyle = '#0a3050';
+        ctx.fillRect(sx, sy+TS-6, TS, 6);
+        glow('#0af', 8);
+        ctx.fillRect(sx, sy+TS-4, TS, 3);
+        clearGlow();
+      }
+    }
+  }
+}
+
+// ── Draw Exit ─────────────────────────────────────────────────────────────────
+function drawExit() {
+  const ex = wx(levelData.exitX - TS/2);
+  const ey = wy(levelData.exitY - TS*2);
+  const t  = Date.now() / 600;
+  const pulse = Math.sin(t) * 0.3 + 0.7;
+
+  glow('#ff0', 20 * pulse);
+  ctx.fillStyle = `rgba(255,220,0,${0.6*pulse})`;
+  ctx.fillRect(ex, ey, TS, TS*2);
+
+  ctx.fillStyle = '#ff0';
+  ctx.font = 'bold 14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('EXIT', ex + TS/2, ey - 8);
+  clearGlow();
+}
+
+// ── Draw Player ───────────────────────────────────────────────────────────────
+function drawPlayer() {
+  const p = player;
+  if (p.dead) return;
+  if (p.invincible > 0 && Math.floor(Date.now()/80) % 2 === 0) return;
+
+  const sx = wx(p.x), sy = wy(p.y);
+  const flip = p.dir < 0;
+
+  ctx.save();
+  ctx.translate(sx + PW/2, sy);
+  if (flip) ctx.scale(-1, 1);
+
+  // Legs (animated walk)
+  const legOff = p.grounded ? Math.sin(p.frame * 1.5) * 4 : 0;
+  glow('#0af', 6);
+  ctx.fillRect(-7, PH-10, 5, 10 + legOff);   // left leg
+  ctx.fillRect(2,  PH-10, 5, 10 - legOff);   // right leg
+
+  // Body
+  glow('#0ff', 12);
+  ctx.fillRect(-7, 8, 14, 12);   // torso
+
+  // Jetpack/backpack
+  ctx.fillStyle = '#08a';
+  ctx.fillRect(-9, 9, 3, 8);
+
+  // Head
+  glow('#0ff', 10);
+  ctx.fillRect(-5, -2, 10, 10);  // helmet
+
+  // Visor
+  ctx.fillStyle = '#001830';
+  ctx.fillRect(-4, 0, 8, 5);
+  glow('#08f', 4);
+  ctx.fillStyle = '#0088cc';
+  ctx.fillRect(-3, 1, 6, 3);     // visor glow
+
+  // Gun arm
+  glow('#0af', 8);
+  ctx.fillRect(7, 11, 12, 4);    // gun barrel
+  ctx.fillRect(5, 9, 5, 6);      // gun body
+
+  ctx.restore();
+}
+
+// ── Draw Aliens ───────────────────────────────────────────────────────────────
+function drawAliens() {
+  for (const a of aliens) {
+    if (!a.alive) continue;
+    const sx = wx(a.x), sy = wy(a.y);
+    const bob = Math.sin(a.frameT * 8 + a.frame) * 2;
+
+    ctx.save();
+    ctx.translate(sx + 9, sy + bob);
+
+    if (a.type === 1) {
+      // Walker – green armoured bug
+      glow('#0f4', 10);
+      // Body
+      ctx.fillRect(-8, 4, 16, 14);   // carapace
+      ctx.fillRect(-6, 0, 12, 6);    // head
+      // Eyes
+      ctx.fillStyle = '#ff0';
+      ctx.shadowColor = '#ff0'; ctx.shadowBlur = 8;
+      ctx.fillRect(-4, 1, 3, 3);
+      ctx.fillRect(1, 1, 3, 3);
+      // Legs (animated)
+      glow('#0a3', 4);
+      const lk = a.frame % 2 === 0 ? 3 : 0;
+      ctx.fillRect(-10, 10, 3, 6+lk); ctx.fillRect(7, 10, 3, 6-lk);
+      ctx.fillRect(-11, 6, 3, 4); ctx.fillRect(8, 6, 3, 4);
+      // Gun mount
+      glow('#0f4', 6);
+      ctx.fillRect(a.dir>0?8:-16, 5, 8, 3);
+
+    } else if (a.type === 2) {
+      // Floater – purple jellyfish
+      glow('#a0f', 14);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 12, 9, 0, 0, Math.PI*2);
+      ctx.fill();
+      // Eye
+      ctx.fillStyle = '#ff4';
+      ctx.shadowColor='#ff4'; ctx.shadowBlur=10;
+      ctx.beginPath(); ctx.ellipse(0, -2, 5, 4, 0, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#200';
+      ctx.beginPath(); ctx.ellipse(1, -2, 2, 2, 0, 0, Math.PI*2); ctx.fill();
+      // Tentacles
+      glow('#70a', 6);
+      for (let i=-2; i<=2; i++) {
+        const ty = Math.sin(Date.now()/300 + i) * 5;
+        ctx.fillRect(i*4-1, 9, 2, 6+ty);
+      }
+
+    } else if (a.type === 3) {
+      // Spitter – red cannon turret
+      glow('#f40', 12);
+      ctx.fillRect(-10, -2, 20, 18);  // base
+      ctx.fillRect(-7, -8, 14, 8);    // turret body
+      // Face/mouth
+      ctx.fillStyle = '#600';
+      ctx.fillRect(-5, -6, 4, 3);
+      ctx.fillRect(1, -6, 4, 3);
+      // Aiming at player dir
+      const pd = a.x < (player.x + PW/2) ? 1 : -1;
+      glow('#f60', 8);
+      ctx.fillRect(pd > 0 ? 10 : -22, -3, 12, 5);  // cannon barrel
+      // Heat vent glow
+      glow('#f40', 5);
+      for (let i=0; i<3; i++) {
+        ctx.fillRect(-8+i*6, 8, 4, 3);
+      }
+    }
+
+    ctx.restore();
+  }
+}
+
+// ── Draw Bullets ──────────────────────────────────────────────────────────────
+function drawBullets() {
+  // Player bullets — cyan bolts
+  glow('#0ff', 10);
+  for (const b of pBullets) {
+    if (!b.alive) continue;
+    ctx.fillRect(wx(b.x), wy(b.y), b.w, b.h);
+    // Trail
+    ctx.globalAlpha = 0.3;
+    ctx.fillRect(wx(b.x - b.vx*0.03), wy(b.y), b.w*2, b.h);
+    ctx.globalAlpha = 1;
+  }
+
+  // Alien bullets — orange/red orbs
+  for (const b of aBullets) {
+    if (!b.alive) continue;
+    glow('#f60', 12);
+    ctx.beginPath();
+    ctx.arc(wx(b.x + b.w/2), wy(b.y + b.h/2), b.w/2, 0, Math.PI*2);
+    ctx.fill();
+  }
+  clearGlow();
+}
+
+// ── Draw Particles ────────────────────────────────────────────────────────────
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / 0.5;
+    ctx.globalAlpha = Math.min(1, alpha);
+    glow(p.color, 8);
+    ctx.beginPath();
+    ctx.arc(wx(p.x), wy(p.y), p.size * alpha, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  clearGlow();
+}
+
+// ── Draw HUD (in-world) ───────────────────────────────────────────────────────
+function drawHUD() {
+  const p = player;
+  // HP bar (top-left screen space)
+  const hpStr = '♥'.repeat(p.hp) + '♡'.repeat(p.maxHp - p.hp);
+  document.getElementById('uiHp').textContent = `${hpStr}  ✦${lives}`;
+}
+
+// ── Draw Stars ────────────────────────────────────────────────────────────────
+function drawStars() {
+  for (const s of STARS) {
+    const sx = ((s.x - camX * 0.2) % C.width  + C.width)  % C.width;
+    const sy = (s.y % C.height + C.height) % C.height;
+    ctx.globalAlpha = s.a;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(sx, sy, s.r, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ── Draw Start/End Screens ────────────────────────────────────────────────────
+const $msg = document.getElementById('msg');
+function showMsg(html, color='#0ff') {
+  $msg.style.color = color;
+  $msg.style.textShadow = `0 0 20px ${color}`;
+  $msg.innerHTML = html;
+  $msg.style.display = 'block';
+}
+function hideMsg() { $msg.style.display = 'none'; }
+
+// ── Game Events ───────────────────────────────────────────────────────────────
+function winLevel() {
+  if (phase !== 'play') return;
+  phase = 'win';
+  SFX.levelWin();
+  if (levelIdx < 3 - 1) {
+    showMsg(`LEVEL ${levelIdx+1} CLEAR!<br><small style="font-size:18px">Press Space to continue</small>`, '#ff0');
+  } else {
+    showMsg(`MISSION COMPLETE!<br><small style="font-size:18px">SCORE: ${score}<br>Press Space to restart</small>`, '#ff0');
+  }
+}
+
+function onPlayerDead() {
+  lives--;
+  if (lives <= 0) {
+    phase = 'gameover';
+    showMsg(`GAME OVER<br><small style="font-size:18px">SCORE: ${score}<br>Press Space to restart</small>`, '#f44');
+  } else {
+    phase = 'respawn';
+    showMsg(`LIVES: ${'✦'.repeat(lives)}<br><small style="font-size:18px">Press Space to continue</small>`, '#f80');
+  }
+}
+
+function startGame() {
+  score = 0; lives = 3; levelIdx = 0;
+  document.getElementById('uiScore').textContent = '0';
+  loadLevel(0);
+  hideMsg();
+  phase = 'play';
+}
+
+function nextLevel() {
+  levelIdx++;
+  loadLevel(levelIdx);
+  hideMsg();
+  phase = 'play';
+}
+
+function respawn() {
+  loadLevel(levelIdx);
+  hideMsg();
+  phase = 'play';
+}
+
+// ── Main Loop ─────────────────────────────────────────────────────────────────
+let lastT = null;
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (!lastT) { lastT = ts; return; }
+  const dt = Math.min((ts - lastT) / 1000, 0.05);
+  lastT = ts;
+
+  // Input for menus
+  const anyKey = K.Space || K.Enter || K.KeyZ;
+  if (phase === 'start' && anyKey) { K.Space=K.Enter=K.KeyZ=false; startGame(); return; }
+  if (phase === 'win')    {
+    if (anyKey) {
+      K.Space=K.Enter=K.KeyZ=false;
+      if (levelIdx < 3-1) nextLevel(); else startGame();
+    }
+    // Still render
+  }
+  if ((phase === 'gameover') && anyKey) { K.Space=K.Enter=K.KeyZ=false; startGame(); return; }
+  if (phase === 'respawn' && anyKey) { K.Space=K.Enter=K.KeyZ=false; respawn(); return; }
+
+  // Update
+  if (phase === 'play') {
+    updatePlayer(dt);
+    updateAliens(dt);
+    updateBullets(dt);
+    updateParticles(dt);
+    updateCamera();
+  }
+
+  // Render
+  ctx.fillStyle = '#020208';
+  ctx.fillRect(0, 0, C.width, C.height);
+  drawStars();
+
+  if (phase !== 'start') {
+    drawTiles();
+    drawExit();
+    drawParticles();
+    drawAliens();
+    drawPlayer();
+    drawBullets();
+    drawHUD();
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+showMsg(
+  'ALIEN ATTACK<br>' +
+  '<small style="font-size:14px;color:#8ff">' +
+  'A/D or ← → &nbsp; Move<br>' +
+  'W / ↑ / Space &nbsp; Jump<br>' +
+  'Z / Shift &nbsp; Shoot (← →) &nbsp; Up + Shoot &nbsp; Fire up<br>' +
+  '</small><br>' +
+  '<span style="font-size:16px">Press Space to start</span>',
+  '#0ff'
+);
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>

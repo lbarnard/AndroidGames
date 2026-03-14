@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Wilbur Lander</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; }
+    canvas { display: block; cursor: pointer; }
+    #rotate-zone {
+      position: fixed; left: 0; top: 0; width: 55%; height: 100%;
+      touch-action: none;
+    }
+    #rotate-indicator {
+      position: fixed; bottom: 32px; left: 0; width: 55%;
+      display: flex; flex-direction: column; align-items: center;
+      pointer-events: none;
+    }
+    #rotate-track {
+      width: 180px; height: 10px; border-radius: 5px;
+      background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.25);
+      position: relative;
+    }
+    #rotate-thumb {
+      position: absolute; top: -7px; left: 50%; transform: translateX(-50%);
+      width: 24px; height: 24px; border-radius: 50%;
+      background: rgba(255,255,255,0.5); border: 2px solid #fff;
+      transition: left 0.05s;
+    }
+    #rotate-label {
+      color: rgba(255,255,255,0.35); font-size: 11px; margin-top: 6px;
+      font-family: Courier New;
+    }
+    #thrust-zone {
+      position: fixed; right: 0; top: 0; width: 45%; height: 100%;
+      display: flex; align-items: flex-end; justify-content: center;
+      padding-bottom: 28px;
+      touch-action: none;
+    }
+    #thrust-ring {
+      width: 110px; height: 110px; border-radius: 50%;
+      border: 3px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.07);
+      display: flex; align-items: center; justify-content: center;
+      color: rgba(255,255,255,0.4); font-size: 36px;
+      font-family: Courier New; pointer-events: none;
+      transition: background 0.1s, border-color 0.1s;
+    }
+    #thrust-ring.active {
+      background: rgba(255,160,0,0.25); border-color: rgba(255,160,0,0.7);
+      color: rgba(255,200,80,0.9);
+    }
+    #close-btn {
+      position: fixed; top: 12px; right: 12px;
+      width: 36px; height: 36px; border-radius: 50%;
+      background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.25);
+      color: rgba(255,255,255,0.5); font-size: 18px; line-height: 36px;
+      text-align: center; cursor: pointer; z-index: 100;
+      user-select: none; -webkit-user-select: none;
+    }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="rotate-zone"></div>
+<div id="rotate-indicator">
+  <div id="rotate-track"><div id="rotate-thumb"></div></div>
+  <div id="rotate-label">◀ rotate ▶</div>
+</div>
+<div id="thrust-zone"><div id="thrust-ring">▲</div></div>
+<div id="close-btn" onclick="if(window.Android) Android.closeApp(); else window.close();">✕</div>
+<script>
+const cvs = document.getElementById('c');
+const ctx = cvs.getContext('2d');
+
+let W, H, SHIP_SCALE;
+function resize() {
+  W = cvs.width  = window.innerWidth;
+  H = cvs.height = window.innerHeight;
+  SHIP_SCALE = Math.min(W, H) / 500;
+}
+resize();
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const GRAVITY   = 0.006;
+const THRUST    = 0.01625;
+const ROTATE    = 2.8;    // degrees per frame
+const FUEL_USE  = 0.01;   // fuel per frame while thrusting
+const LAND_VS   = 2.5;    // max safe vertical speed
+const LAND_HS   = 1.5;    // max safe horizontal speed
+const LAND_ANG  = 15;     // max safe tilt (degrees from upright)
+
+// ── State ────────────────────────────────────────────────────────────────────
+let phase = 'start'; // 'start' | 'play' | 'land' | 'crash'
+let lander, stars, terrain, pads, particles, score;
+const keys = {};
+
+// ── Input ────────────────────────────────────────────────────────────────────
+addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if ('rR'.includes(e.key) && phase !== 'play') startGame();
+  if (['ArrowUp', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.key] = false; });
+cvs.addEventListener('click', () => { if (phase !== 'play') startGame(); });
+
+// Touch controls
+const rotateZone = document.getElementById('rotate-zone');
+const rotateThumb = document.getElementById('rotate-thumb');
+const thrustZone  = document.getElementById('thrust-zone');
+const thrustRing  = document.getElementById('thrust-ring');
+
+let rotateTouchId = null;
+let touchAngle = null; // null = not touching, otherwise absolute degrees
+
+function setThumb(norm) {
+  // norm: -1..1
+  rotateThumb.style.left = ((norm + 1) / 2 * 100) + '%';
+}
+setThumb(0);
+
+function normFromTouch(clientX) {
+  const r = rotateZone.getBoundingClientRect();
+  return Math.max(-1, Math.min(1, (clientX - r.left - r.width / 2) / (r.width / 2)));
+}
+
+rotateZone.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (rotateTouchId !== null) return;
+  const t = e.changedTouches[0];
+  rotateTouchId = t.identifier;
+  const norm = normFromTouch(t.clientX);
+  touchAngle = norm * 90;
+  setThumb(norm);
+}, { passive: false });
+
+rotateZone.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier !== rotateTouchId) continue;
+    const norm = normFromTouch(t.clientX);
+    touchAngle = norm * 90;
+    setThumb(norm);
+  }
+}, { passive: false });
+
+rotateZone.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier !== rotateTouchId) continue;
+    rotateTouchId = null;
+    touchAngle = null;
+    setThumb(0);
+  }
+}, { passive: false });
+
+thrustZone.addEventListener('touchstart', e => {
+  e.preventDefault();
+  keys['ArrowUp'] = true;
+  thrustRing.classList.add('active');
+  if (phase !== 'play') startGame();
+}, { passive: false });
+
+thrustZone.addEventListener('touchend', e => {
+  e.preventDefault();
+  keys['ArrowUp'] = false;
+  thrustRing.classList.remove('active');
+}, { passive: false });
+
+window.addEventListener('resize', () => {
+  resize();
+  buildStars();
+  buildTerrain();
+  if (phase === 'play') phase = 'start';
+});
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+const rand  = (n = 1) => Math.random() * n;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+function startGame() {
+  buildStars();
+  buildTerrain();
+  lander = {
+    x: W / 2, y: 70,
+    vx: (Math.random() - 0.5) * 0.6,
+    vy: 0.3,
+    angle: 0,   // 0 = pointing straight up
+    fuel: 100,
+    thrust: false
+  };
+  particles = [];
+  score = 0;
+  phase = 'play';
+}
+
+function buildStars() {
+  stars = Array.from({ length: 200 }, () => ({
+    x: rand(W), y: rand(H * 0.72),
+    r: rand(1.2) + 0.3,
+    a: rand(0.6) + 0.4
+  }));
+}
+
+function buildTerrain() {
+  terrain = []; pads = [];
+  const N = 50, sw = W / N;
+
+  // Random heights with smoothing
+  let ys = [H * 0.58 + rand(H * 0.18)];
+  for (let i = 1; i <= N; i++) {
+    ys.push(clamp(ys[i - 1] + (rand(60) - 30), H * 0.40, H * 0.82));
+  }
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 1; i < ys.length - 1; i++) {
+      ys[i] = (ys[i - 1] + ys[i] + ys[i + 1]) / 3;
+    }
+  }
+
+  // Landing pads (2–3, spread across terrain)
+  const nPads = 2 + (Math.random() < 0.4 ? 1 : 0);
+  for (let p = 0; p < nPads; p++) {
+    const zs = Math.floor(p * N / nPads) + 2;
+    const ze = Math.floor((p + 1) * N / nPads) - 2;
+    const pw = (W < 900 ? 4 : 2) + Math.floor(rand(3)); // wider pads on mobile
+    const range = Math.max(1, ze - zs - pw);
+    const s = zs + Math.floor(rand(range));
+    const e = s + pw;
+    const py = ys[s];
+    for (let i = s; i <= e; i++) ys[i] = py; // flatten pad
+    pads.push({
+      x1: s * sw, x2: e * sw, y: py,
+      pts: Math.round(900 / pw + 100) // narrower = higher score
+    });
+  }
+
+  for (let i = 0; i <= N; i++) terrain.push({ x: i * sw, y: ys[i] });
+}
+
+// ── Terrain helpers ───────────────────────────────────────────────────────────
+function terrainY(x) {
+  if (x < 0 || x > W) return H + 100; // off-screen: no collision
+  for (let i = 0; i < terrain.length - 1; i++) {
+    const a = terrain[i], b = terrain[i + 1];
+    if (x >= a.x && x <= b.x) {
+      return a.y + (x - a.x) / (b.x - a.x) * (b.y - a.y);
+    }
+  }
+  return H;
+}
+
+function padUnder(x) {
+  return pads.find(p => x >= p.x1 && x <= p.x2) || null;
+}
+
+// ── Particles ─────────────────────────────────────────────────────────────────
+function spawnExplosion(x, y) {
+  const colors = ['#ff6600', '#ffcc00', '#ffeeaa', '#ffffff'];
+  for (let i = 0; i < 70; i++) {
+    const ang = rand(Math.PI * 2), spd = rand(5) + 0.5;
+    particles.push({
+      x, y,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd,
+      life: 1,
+      dec: 0.015 + rand(0.02),
+      sz: rand(4) + 1,
+      col: colors[Math.floor(rand(colors.length))]
+    });
+  }
+}
+
+function spawnJet(x, y, angleDeg) {
+  const r = (angleDeg + 180) * Math.PI / 180;
+  const spread = (rand() - 0.5) * 0.7;
+  const spd = 1.5 + rand(2);
+  const colors = ['#ffffff', '#ffd080', '#ff8800', '#ff4400'];
+  particles.push({
+    x: x + Math.sin(r) * 16 * SHIP_SCALE,
+    y: y - Math.cos(r) * 16 * SHIP_SCALE,
+    vx: Math.sin(r + spread) * spd,
+    vy: -Math.cos(r + spread) * spd,
+    life: 1,
+    dec: 0.04 + rand(0.04),
+    sz: 1 + rand(2.5),
+    col: colors[Math.floor(rand(colors.length))]
+  });
+}
+
+function tickParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vy += 0.04 * dt; // particle gravity
+    p.life -= p.dec * dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+let audioCtx, thrustSrc, thrustGain;
+
+function getAC() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function startThrustSound() {
+  if (thrustSrc) return;
+  const a = getAC();
+  const buf = a.createBuffer(1, a.sampleRate, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+
+  thrustSrc = a.createBufferSource();
+  thrustSrc.buffer = buf;
+  thrustSrc.loop = true;
+
+  const filter = a.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 110;
+  filter.Q.value = 0.8;
+
+  thrustGain = a.createGain();
+  thrustGain.gain.setValueAtTime(0, a.currentTime);
+  thrustGain.gain.linearRampToValueAtTime(0.35, a.currentTime + 0.12);
+
+  thrustSrc.connect(filter);
+  filter.connect(thrustGain);
+  thrustGain.connect(a.destination);
+  thrustSrc.start();
+}
+
+function stopThrustSound() {
+  if (!thrustSrc) return;
+  const a = getAC();
+  thrustGain.gain.setTargetAtTime(0, a.currentTime, 0.05);
+  const src = thrustSrc;
+  thrustSrc = null; thrustGain = null;
+  setTimeout(() => { try { src.stop(); } catch (_) {} }, 400);
+}
+
+function playExplosion() {
+  const a = getAC();
+  const dur = 2.0;
+  const buf = a.createBuffer(1, a.sampleRate * dur, a.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) {
+    d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 1.2);
+  }
+  const src = a.createBufferSource();
+  src.buffer = buf;
+
+  const filter = a.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(1200, a.currentTime);
+  filter.frequency.exponentialRampToValueAtTime(60, a.currentTime + 0.6);
+
+  const gain = a.createGain();
+  gain.gain.value = 1.0;
+
+  src.connect(filter); filter.connect(gain); gain.connect(a.destination);
+  src.start();
+}
+
+function playLanding() {
+  const a = getAC();
+  const now = a.currentTime;
+  [523, 659, 784, 1047].forEach((freq, i) => {
+    const osc = a.createOscillator();
+    const gain = a.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, now + i * 0.13);
+    gain.gain.linearRampToValueAtTime(0.18, now + i * 0.13 + 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.13 + 1.4);
+    osc.connect(gain); gain.connect(a.destination);
+    osc.start(now + i * 0.13);
+    osc.stop(now + i * 0.13 + 1.4);
+  });
+}
+
+// ── Physics ───────────────────────────────────────────────────────────────────
+function tick(dt) {
+  if (phase !== 'play') return;
+
+  const rad = lander.angle * Math.PI / 180;
+
+  // Rotation
+  if (touchAngle !== null) {
+    lander.angle = touchAngle;
+  } else {
+    if (keys['ArrowLeft']  || keys['a'] || keys['A']) lander.angle -= ROTATE * dt;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) lander.angle += ROTATE * dt;
+  }
+
+  // Thrust
+  const thrusting = (keys['ArrowUp'] || keys['w'] || keys['W']) && lander.fuel > 0;
+  lander.thrust = thrusting;
+  if (thrusting) {
+    lander.vx += Math.sin(rad) * THRUST * dt;
+    lander.vy -= Math.cos(rad) * THRUST * dt;
+    lander.fuel = Math.max(0, lander.fuel - FUEL_USE * dt);
+    if (rand() < 0.85) spawnJet(lander.x, lander.y, lander.angle);
+    startThrustSound();
+  } else {
+    stopThrustSound();
+  }
+
+  // Gravity
+  lander.vy += GRAVITY * dt;
+
+  // Move
+  lander.x += lander.vx * dt;
+  lander.y += lander.vy * dt;
+
+  // Horizontal wrap
+  if (lander.x < 0) lander.x = W;
+  if (lander.x > W) lander.x = 0;
+
+  // Collision: check three contact points (left foot, right foot, body base)
+  const contacts = [{ lx: -15 * SHIP_SCALE, ly: 16 * SHIP_SCALE }, { lx: 15 * SHIP_SCALE, ly: 16 * SHIP_SCALE }, { lx: 0, ly: 10 * SHIP_SCALE }];
+  for (const c of contacts) {
+    const fx = lander.x + c.lx * Math.cos(rad) - c.ly * Math.sin(rad);
+    const fy = lander.y + c.lx * Math.sin(rad) + c.ly * Math.cos(rad);
+    if (fy >= terrainY(fx)) {
+      resolveCollision(fx);
+      return;
+    }
+  }
+}
+
+function resolveCollision(fx) {
+  const ang = ((lander.angle % 360) + 360) % 360;
+  const tilt = ang > 180 ? 360 - ang : ang;
+  const pad = padUnder(fx);
+
+  const safe = pad
+    && Math.abs(lander.vx) <= LAND_HS
+    && lander.vy <= LAND_VS
+    && tilt <= LAND_ANG;
+
+  if (safe) {
+    const fuelBonus  = Math.round(lander.fuel * 3);
+    const speedBonus = Math.round(Math.max(0, (LAND_VS - lander.vy) * 40));
+    score = pad.pts + fuelBonus + speedBonus;
+    stopThrustSound();
+    playLanding();
+    phase = 'land';
+  } else {
+    spawnExplosion(lander.x, lander.y);
+    stopThrustSound();
+    playExplosion();
+    phase = 'crash';
+  }
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  ctx.fillStyle = '#06080f';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  for (const s of stars) {
+    ctx.globalAlpha = s.a;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  if (phase === 'start') { drawStart(); return; }
+
+  drawTerrain();
+  drawParticles();
+  if (phase !== 'crash') drawShip();
+  drawHUD();
+
+  if (phase === 'land')  drawBanner('LANDED!',  `Score: ${score} points`, '#00ff88');
+  if (phase === 'crash') drawBanner('CRASHED!', 'Better luck next time!', '#ff4444');
+}
+
+function drawTerrain() {
+  ctx.beginPath();
+  terrain.forEach((pt, i) => i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y));
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = '#22222e';
+  ctx.fill();
+
+  ctx.beginPath();
+  terrain.forEach((pt, i) => i ? ctx.lineTo(pt.x, pt.y) : ctx.moveTo(pt.x, pt.y));
+  ctx.strokeStyle = '#7778aa'; ctx.lineWidth = 2; ctx.stroke();
+
+  for (const pad of pads) {
+    const pw = pad.x2 - pad.x1;
+    ctx.fillStyle = '#00cc44';
+    ctx.fillRect(pad.x1, pad.y - 5, pw, 5);
+    ctx.fillStyle = '#00ff66';
+    ctx.fillRect(pad.x1,     pad.y - 14, 4, 14);
+    ctx.fillRect(pad.x2 - 4, pad.y - 14, 4, 14);
+    ctx.fillStyle = '#44ff88';
+    ctx.font = '11px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(pad.pts + ' pts', (pad.x1 + pad.x2) / 2, pad.y - 18);
+  }
+}
+
+function drawShip() {
+  const { x, y, angle, thrust, fuel } = lander;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle * Math.PI / 180);
+  ctx.scale(SHIP_SCALE, SHIP_SCALE);
+
+  if (thrust && fuel > 0) {
+    const fh = 14 + rand(12);
+    const g = ctx.createLinearGradient(0, 11, 0, 11 + fh);
+    g.addColorStop(0,   'rgba(255,255,210,0.95)');
+    g.addColorStop(0.3, 'rgba(255,140,0,0.85)');
+    g.addColorStop(1,   'rgba(255,40,0,0)');
+    ctx.beginPath();
+    ctx.moveTo(-5, 11);
+    ctx.quadraticCurveTo(0, 11 + fh * 1.3, 5, 11);
+    ctx.fillStyle = g; ctx.fill();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(0, -14); ctx.lineTo(-11, 10); ctx.lineTo(11, 10);
+  ctx.closePath();
+  ctx.fillStyle = '#c8c8d4'; ctx.fill();
+  ctx.strokeStyle = '#eeeeff'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  ctx.beginPath(); ctx.arc(0, -3, 5, 0, Math.PI * 2);
+  ctx.fillStyle = '#3388ee'; ctx.fill();
+  ctx.strokeStyle = '#99ccff'; ctx.lineWidth = 1; ctx.stroke();
+
+  ctx.strokeStyle = '#9999aa'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-8, 8); ctx.lineTo(-15, 16); ctx.lineTo(-10, 16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo( 8, 8); ctx.lineTo( 15, 16); ctx.lineTo( 10, 16); ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.col;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.sz, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  const alt = Math.round(Math.max(0, terrainY(lander.x) - lander.y));
+  const hs  = Math.abs(lander.vx).toFixed(1);
+  const vs  = lander.vy.toFixed(1);
+  const fl  = Math.round(lander.fuel);
+
+  const G = '#00ff88', Y = '#ffcc00', R = '#ff4444';
+
+  ctx.fillStyle = 'rgba(0,0,15,0.68)';
+  ctx.fillRect(8, 8, 196, 112);
+  ctx.strokeStyle = '#223344'; ctx.lineWidth = 1;
+  ctx.strokeRect(8, 8, 196, 112);
+
+  ctx.font = '13px Courier New';
+  ctx.textAlign = 'left';
+
+  const stat = (label, val, y, col) => {
+    ctx.fillStyle = '#7788bb'; ctx.fillText(label, 16, y);
+    ctx.fillStyle = col;       ctx.fillText(val, 132, y);
+  };
+
+  stat('ALTITUDE', alt + ' m',   28, alt > 100 ? G : alt > 30 ? Y : R);
+  stat('H-SPEED',  hs  + ' m/s', 46, +hs <= LAND_HS ? G : R);
+  stat('V-SPEED',  vs  + ' m/s', 64, +vs <= LAND_VS ? G : +vs <= LAND_VS * 1.8 ? Y : R);
+  stat('FUEL',     fl  + '%',    82, fl > 50 ? G : fl > 20 ? Y : R);
+
+  ctx.fillStyle = '#111122'; ctx.fillRect(16, 91, 180, 11);
+  ctx.fillStyle = fl > 50 ? '#00bb55' : fl > 20 ? '#bbaa00' : '#bb2222';
+  ctx.fillRect(16, 91, 180 * fl / 100, 11);
+  ctx.strokeStyle = '#334'; ctx.lineWidth = 1;
+  ctx.strokeRect(16, 91, 180, 11);
+
+}
+
+function drawBanner(title, sub, col) {
+  ctx.fillStyle = 'rgba(0,0,0,0.65)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = col;
+  ctx.font = 'bold 54px Courier New';
+  ctx.fillText(title, W / 2, H / 2 - 36);
+
+  ctx.fillStyle = '#ccccdd';
+  ctx.font = '20px Courier New';
+  ctx.fillText(sub, W / 2, H / 2 + 14);
+
+  ctx.fillStyle = '#667788';
+  ctx.font = '15px Courier New';
+  ctx.fillText('Tap right side to play again', W / 2, H / 2 + 50);
+}
+
+function drawStart() {
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = '#aaddff';
+  ctx.font = `bold ${Math.min(54, W / 10)}px Courier New`;
+  ctx.fillText('WILBUR LANDER', W / 2, H / 2 - 100);
+
+  ctx.font = '15px Courier New';
+  ctx.fillStyle = '#8899bb';
+  [
+    'Slide left   ◀ Rotate ▶   Slide right',
+    'Tap right side to thrust',
+    '',
+    'Land gently on the green pads.',
+    'Low speed + upright = safe landing.',
+    'Remaining fuel earns bonus points.',
+    'Smaller pads score higher.'
+  ].forEach((line, i) => ctx.fillText(line, W / 2, H / 2 - 20 + i * 24));
+
+  if (Math.floor(Date.now() / 600) % 2 === 0) {
+    ctx.fillStyle = '#00ff88';
+    ctx.font = 'bold 20px Courier New';
+    ctx.fillText('Tap right side to launch!', W / 2, H / 2 + 148);
+  }
+}
+
+// ── Main Loop ─────────────────────────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  const dt = lastTime ? Math.min((ts - lastTime) / 16.667, 3) : 1;
+  lastTime = ts;
+  tickParticles(dt);
+  tick(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+// Bootstrap
+stars = []; terrain = []; pads = []; particles = [];
+buildStars();
+buildTerrain();
+lander = { x: W / 2, y: 70, vx: 0, vy: 0, angle: 0, fuel: 100, thrust: false };
+loop();
+</script>
+</body>
+</html>

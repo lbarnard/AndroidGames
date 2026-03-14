@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Horizon — Flight Sim</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box }
+body { background:#000; overflow:hidden; font-family:monospace }
+canvas { display:block }
+#hud {
+  position:fixed; top:0; left:0; width:100%; height:100%;
+  pointer-events:none; color:#00ffcc; font-size:13px;
+  text-shadow:0 0 6px #00ffcc80;
+}
+#top {
+  position:absolute; top:14px; left:50%; transform:translateX(-50%);
+  letter-spacing:2px; white-space:nowrap; background:#0003;
+  padding:4px 16px; border:1px solid #00ffcc40; border-radius:3px;
+}
+#left  { position:absolute; bottom:56px; left:20px; line-height:2 }
+#right { position:absolute; bottom:56px; right:20px; text-align:right; line-height:2 }
+#keys  {
+  position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+  opacity:.5; font-size:11px; white-space:nowrap; letter-spacing:1px;
+}
+.bar  { display:inline-block; width:100px; height:8px; background:#004;
+        border:1px solid #00ffcc60; vertical-align:middle; margin-left:6px }
+.fill { height:100%; background:#00ffcc }
+#msg  {
+  position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+  text-align:center; display:none; font-size:30px; line-height:1.8;
+  color:#ff4455; text-shadow:0 0 12px #ff4455;
+}
+/* Artificial horizon */
+#ah {
+  position:absolute; top:50%; left:50%;
+  transform:translate(-50%,-50%);
+  width:80px; height:80px; border-radius:50%;
+  border:2px solid #00ffcc60; overflow:hidden; pointer-events:none;
+}
+#ah-bg { width:100%; height:200%; background:linear-gradient(#3a7bc8 50%, #5a3c1a 50%); }
+#ah-line {
+  position:absolute; top:50%; left:0; width:100%; height:2px;
+  background:#00ffcc; transform:translateY(-50%);
+}
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="top">
+    <span id="spd">SPD — kt</span>
+    &emsp;<span id="alt">ALT — ft</span>
+    &emsp;<span id="hdg">HDG —°</span>
+  </div>
+  <div id="left">
+    <div>THROTTLE<span class="bar"><span class="fill" id="tf" style="width:50%"></span></span></div>
+    <div id="tv">50 %</div>
+    <div id="stall" style="color:#ff4455;display:none">⚠ STALL</div>
+  </div>
+  <div id="right">
+    <div id="gs">G  1.0</div>
+    <div id="vs">V/S +0 fpm</div>
+    <div id="camtxt" style="opacity:.6;font-size:11px">CHASE CAM</div>
+  </div>
+  <div id="ah"><div id="ah-bg"></div><div id="ah-line"></div></div>
+  <div id="keys">
+    W/S · Pitch &ensp; A/D · Roll &ensp; Q/E · Yaw &ensp; Shift · Throttle+ &ensp; Ctrl · Throttle− &ensp; V · Camera &ensp; R · Restart
+  </div>
+  <div id="msg"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>'use strict';
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const CHUNK_N   = 33;      // vertices per chunk side (2^n + 1)
+const CHUNK_W   = 512;     // world units per chunk
+const CELL_W    = CHUNK_W / (CHUNK_N - 1);
+const VIEW_R    = 3;       // loaded chunk radius
+const T_FREQ    = 0.0018;  // terrain noise frequency
+const T_AMP     = 300;     // max terrain height (m)
+const GRAVITY   = 9.8;     // m/s²
+const MAX_THR   = 100;     // max thrust m/s²
+const LIFT_K    = 0.25;    // lift = speed * LIFT_K (simplified)
+const DRAG_K    = 0.02;    // drag = speed² * DRAG_K
+const STALL_SPD = 18;      // below this speed, lift collapses
+const PITCH_R   = 55;      // max pitch rate °/s
+const ROLL_R    = 80;
+const YAW_R     = 20;
+
+// ── Value Noise (2D) ──────────────────────────────────────────────────────────
+function ihash(ix, iz) {
+  let h = (Math.imul(ix, 92837111) ^ Math.imul(iz, 689287499)) | 0;
+  h ^= h >>> 16;
+  h  = Math.imul(h, 0x45d9f3b) | 0;
+  h ^= h >>> 16;
+  return (h >>> 0) / 0x100000000;
+}
+
+function vnoise(x, z) {
+  const ix = Math.floor(x), iz = Math.floor(z);
+  const fx = x - ix, fz = z - iz;
+  const ux = fx*fx*(3-2*fx), uz = fz*fz*(3-2*fz);
+  return ihash(ix,   iz)   * (1-ux)*(1-uz)
+       + ihash(ix+1, iz)   *    ux *(1-uz)
+       + ihash(ix,   iz+1) * (1-ux)*   uz
+       + ihash(ix+1, iz+1) *    ux *   uz;
+}
+
+function fbm(x, z, oct) {
+  let v=0, a=0.5, f=1, t=0;
+  for (let i=0; i<oct; i++) { v+=vnoise(x*f,z*f)*a; t+=a; a*=0.5; f*=2.1; }
+  return v / t;
+}
+
+function terrainY(wx, wz) {
+  const raw = fbm(wx * T_FREQ, wz * T_FREQ, 7);
+  return Math.max(0, (raw - 0.38) / 0.62) * T_AMP;
+}
+
+function terrainColor(h) {
+  if (h < 2)   return new THREE.Color(0xd4c57a);  // sand
+  if (h < 90)  return new THREE.Color(0x3d8c38);  // grass
+  if (h < 175) return new THREE.Color(0x7a7070);  // rock
+  return         new THREE.Color(0xeeeeff);        // snow
+}
+
+// ── Renderer & Scene ──────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x7ec8e3);
+scene.fog = new THREE.FogExp2(0x7ec8e3, 0.00032);
+
+const camera = new THREE.PerspectiveCamera(65, 1, 1, 5000);
+
+// Lighting
+scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+const sun = new THREE.DirectionalLight(0xfffbdf, 1.1);
+sun.position.set(600, 1000, 400);
+scene.add(sun);
+
+// Ocean
+const ocean = new THREE.Mesh(
+  new THREE.PlaneGeometry(60000, 60000),
+  new THREE.MeshLambertMaterial({ color: 0x1d7bb5 })
+);
+ocean.rotation.x = -Math.PI / 2;
+ocean.position.y = -0.5;
+scene.add(ocean);
+
+// Static cloud puffs
+const cloudMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+for (let i = 0; i < 50; i++) {
+  const g = new THREE.Group();
+  g.position.set((Math.random()-0.5)*5000, 200+Math.random()*200, (Math.random()-0.5)*5000);
+  const n = 3 + Math.floor(Math.random()*4);
+  for (let j=0; j<n; j++) {
+    const s = new THREE.Mesh(new THREE.SphereGeometry(18+Math.random()*28, 5, 4), cloudMat);
+    s.position.set((Math.random()-0.5)*70, (Math.random()-0.5)*18, (Math.random()-0.5)*70);
+    g.add(s);
+  }
+  scene.add(g);
+}
+
+// ── Terrain Chunks ────────────────────────────────────────────────────────────
+const chunks = new Map();
+let lastCX = null, lastCZ = null;
+
+function chunkKey(cx, cz) { return cx + ',' + cz; }
+
+function buildChunk(cx, cz) {
+  const n = CHUNK_N;
+  const pos = new Float32Array(n * n * 3);
+  const col = new Float32Array(n * n * 3);
+  const idx = [];
+
+  for (let iz = 0; iz < n; iz++) {
+    for (let ix = 0; ix < n; ix++) {
+      const wx = cx * CHUNK_W + ix * CELL_W;
+      const wz = cz * CHUNK_W + iz * CELL_W;
+      const h  = terrainY(wx, wz);
+      const k  = (iz * n + ix) * 3;
+      pos[k] = wx; pos[k+1] = h; pos[k+2] = wz;
+      const c = terrainColor(h);
+      col[k] = c.r; col[k+1] = c.g; col[k+2] = c.b;
+    }
+  }
+  for (let iz = 0; iz < n-1; iz++) {
+    for (let ix = 0; ix < n-1; ix++) {
+      const a = iz*n+ix, b=a+1, c=a+n, d=c+1;
+      idx.push(a, c, b, b, c, d);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+
+  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  mesh.frustumCulled = false;
+  scene.add(mesh);
+  chunks.set(chunkKey(cx, cz), mesh);
+}
+
+function removeChunk(cx, cz) {
+  const m = chunks.get(chunkKey(cx, cz));
+  if (!m) return;
+  scene.remove(m);
+  m.geometry.dispose();
+  m.material.dispose();
+  chunks.delete(chunkKey(cx, cz));
+}
+
+function updateChunks(px, pz) {
+  const cx = Math.floor(px / CHUNK_W);
+  const cz = Math.floor(pz / CHUNK_W);
+  if (cx === lastCX && cz === lastCZ) return;
+  lastCX = cx; lastCZ = cz;
+
+  const toRemove = [];
+  for (const key of chunks.keys()) {
+    const [kx, kz] = key.split(',').map(Number);
+    if (Math.abs(kx-cx) > VIEW_R+1 || Math.abs(kz-cz) > VIEW_R+1) toRemove.push([kx,kz]);
+  }
+  for (const [kx, kz] of toRemove) removeChunk(kx, kz);
+
+  for (let dz = -VIEW_R; dz <= VIEW_R; dz++)
+    for (let dx = -VIEW_R; dx <= VIEW_R; dx++)
+      if (!chunks.has(chunkKey(cx+dx, cz+dz))) buildChunk(cx+dx, cz+dz);
+}
+
+// ── Plane Mesh ────────────────────────────────────────────────────────────────
+const planeGroup = new THREE.Group();
+
+function part(geo, color, px=0, py=0, pz=0, rx=0, ry=0, rz=0) {
+  const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color }));
+  m.position.set(px, py, pz);
+  m.rotation.set(rx, ry, rz);
+  planeGroup.add(m);
+}
+
+const HPI = Math.PI / 2;
+part(new THREE.CylinderGeometry(0.45, 0.32, 7.5, 8),  0xdedede, 0,    0,    0,    HPI, 0, 0); // fuselage
+part(new THREE.ConeGeometry(0.45, 1.8, 8),             0xff3333, 0,    0,    4.45, HPI, 0, 0); // nose
+part(new THREE.BoxGeometry(12, 0.18, 2.6),             0xcccccc, 0,   -0.1,  0.4);              // wings
+part(new THREE.BoxGeometry(4.8, 0.14, 1.5),            0xcccccc, 0,    0.1, -3.2);              // h-tail
+part(new THREE.BoxGeometry(0.14, 1.4, 1.1),            0xcccccc, 0,    0.75,-3.2);              // v-tail
+part(new THREE.CylinderGeometry(0.2, 0.2, 2.2, 6),    0x888888,-2.8, -0.2,  0.9,  HPI, 0, 0); // engine L
+part(new THREE.CylinderGeometry(0.2, 0.2, 2.2, 6),    0x888888, 2.8, -0.2,  0.9,  HPI, 0, 0); // engine R
+part(new THREE.CylinderGeometry(0.22, 0.18, 0.4, 6),  0x444444,-2.8, -0.2,  2.1,  HPI, 0, 0); // exhaust L
+part(new THREE.CylinderGeometry(0.22, 0.18, 0.4, 6),  0x444444, 2.8, -0.2,  2.1,  HPI, 0, 0); // exhaust R
+
+scene.add(planeGroup);
+
+// ── Flight State ──────────────────────────────────────────────────────────────
+const planePos  = new THREE.Vector3(0, 400, 0);
+const planeVel  = new THREE.Vector3(0, 0, 50);
+const planeRot  = new THREE.Euler(0, 0, 0, 'YXZ');
+const planeQuat = new THREE.Quaternion();
+
+let throttle = 0.5;
+let crashed  = false;
+let prevY    = 400;
+
+// pre-allocated vectors to avoid GC pressure
+const _fwd    = new THREE.Vector3();
+const _up     = new THREE.Vector3();
+const _acc    = new THREE.Vector3();
+const _camTgt = new THREE.Vector3();
+const _dragDir= new THREE.Vector3();
+
+// ── Camera ────────────────────────────────────────────────────────────────────
+let camMode = 0;
+const camPos    = new THREE.Vector3(0, 410, -20);
+const camLookAt = new THREE.Vector3(0, 400, 0);
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+let actx, engOsc, engGain;
+
+function startAudio() {
+  if (actx) return;
+  actx    = new AudioContext();
+  engGain = actx.createGain();
+  engGain.gain.value = 0;
+  engGain.connect(actx.destination);
+
+  engOsc = actx.createOscillator();
+  engOsc.type = 'sawtooth';
+  engOsc.frequency.value = 90;
+  engOsc.connect(engGain);
+  engOsc.start();
+
+  // Blend in a bandpass for turbine texture
+  const bpf = actx.createBiquadFilter();
+  bpf.type = 'bandpass';
+  bpf.frequency.value = 280;
+  bpf.Q.value = 0.4;
+  engOsc.connect(bpf);
+  const bpGain = actx.createGain();
+  bpGain.gain.value = 0.4;
+  bpf.connect(bpGain);
+  bpGain.connect(engGain);
+
+  engGain.gain.linearRampToValueAtTime(0.06, actx.currentTime + 0.8);
+}
+
+function updateAudio(speed, thr) {
+  if (!actx) return;
+  const now = actx.currentTime;
+  engOsc.frequency.setTargetAtTime(65 + thr * 120 + speed * 0.35, now, 0.12);
+  engGain.gain.setTargetAtTime(0.03 + thr * 0.08, now, 0.2);
+}
+
+function crashBoom() {
+  if (!actx) return;
+  const dur = 1.2, sr = actx.sampleRate;
+  const buf = actx.createBuffer(1, sr * dur, sr);
+  const d   = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++)
+    d[i] = (Math.random()*2-1) * Math.exp(-i / (sr * 0.18));
+  const src = actx.createBufferSource();
+  src.buffer = buf;
+  const lp = actx.createBiquadFilter();
+  lp.type = 'lowpass'; lp.frequency.value = 500;
+  src.connect(lp); lp.connect(actx.destination);
+  src.start();
+  engGain.gain.setTargetAtTime(0, actx.currentTime, 0.08);
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+const K = {};
+window.addEventListener('keydown', e => {
+  K[e.code] = true;
+  startAudio();
+  if (e.code === 'KeyV') {
+    camMode ^= 1;
+    document.getElementById('camtxt').textContent = camMode ? 'COCKPIT' : 'CHASE CAM';
+  }
+  if (e.code === 'KeyR' && crashed) resetFlight();
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => K[e.code] = false);
+
+function resetFlight() {
+  planePos.set(0, 400, 0);
+  planeVel.set(0, 0, 50);
+  planeRot.set(0, 0, 0);
+  throttle = 0.5;
+  crashed  = false;
+  prevY    = 400;
+  camPos.set(0, 410, -20);
+  camLookAt.set(0, 400, 0);
+  document.getElementById('msg').style.display = 'none';
+}
+
+// ── HUD ───────────────────────────────────────────────────────────────────────
+const $spd   = document.getElementById('spd');
+const $alt   = document.getElementById('alt');
+const $hdg   = document.getElementById('hdg');
+const $tf    = document.getElementById('tf');
+const $tv    = document.getElementById('tv');
+const $gs    = document.getElementById('gs');
+const $vs    = document.getElementById('vs');
+const $stall = document.getElementById('stall');
+const $msg   = document.getElementById('msg');
+const $ahBg  = document.getElementById('ah-bg');
+
+function updateHUD(speed, gForce, vspd) {
+  const kts    = Math.round(speed * 1.944);
+  const ftAlt  = Math.round(planePos.y * 3.281);
+  const hdgDeg = ((-planeRot.y * 180 / Math.PI) % 360 + 360) % 360;
+
+  $spd.textContent = `SPD ${kts} kt`;
+  $alt.textContent = `ALT ${ftAlt} ft`;
+  $hdg.textContent = `HDG ${Math.round(hdgDeg)}°`;
+  $tf.style.width  = `${throttle * 100}%`;
+  $tv.textContent  = `${Math.round(throttle * 100)} %`;
+  $gs.textContent  = `G  ${gForce.toFixed(1)}`;
+  $vs.textContent  = `V/S ${vspd >= 0 ? '+' : ''}${Math.round(vspd * 196)} fpm`;
+
+  $stall.style.display = speed < STALL_SPD ? 'block' : 'none';
+
+  // Artificial horizon: shift bg up/down for pitch, rotate for roll
+  const pitchPx = (planeRot.x / (Math.PI * 0.5)) * 40;
+  const rollDeg  = planeRot.z * 180 / Math.PI;
+  $ahBg.style.transform = `translateY(calc(50% + ${pitchPx}px))`;
+  document.getElementById('ah').style.transform =
+    `translate(-50%, -50%) rotate(${rollDeg}deg)`;
+}
+
+// ── Main Update ───────────────────────────────────────────────────────────────
+let lastT = null;
+
+function update(dt) {
+  if (crashed) return;
+
+  // Throttle
+  if (K.ShiftLeft || K.ShiftRight)      throttle = Math.min(1, throttle + dt * 0.6);
+  if (K.ControlLeft || K.ControlRight)  throttle = Math.max(0, throttle - dt * 0.6);
+
+  // Rotation
+  const PR = PITCH_R * (Math.PI / 180) * dt;
+  const RR = ROLL_R  * (Math.PI / 180) * dt;
+  const YR = YAW_R   * (Math.PI / 180) * dt;
+
+  if (K.KeyW) planeRot.x -= PR;
+  if (K.KeyS) planeRot.x += PR;
+  if (K.KeyA) planeRot.z -= RR;
+  if (K.KeyD) planeRot.z += RR;
+  if (K.KeyQ) planeRot.y += YR;
+  if (K.KeyE) planeRot.y -= YR;
+
+  planeRot.x = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45, planeRot.x));
+  planeRot.z = Math.max(-Math.PI * 0.55, Math.min(Math.PI * 0.55, planeRot.z));
+
+  // Gentle auto-level roll when no input
+  if (!K.KeyA && !K.KeyD) planeRot.z *= Math.pow(0.985, dt * 60);
+
+  planeQuat.setFromEuler(planeRot);
+  _fwd.set(0, 0, 1).applyQuaternion(planeQuat);
+  _up.set(0, 1, 0).applyQuaternion(planeQuat);
+
+  const speed = planeVel.length();
+
+  // Stall: lift drops sharply below stall speed
+  const liftFactor = speed < STALL_SPD
+    ? (speed / STALL_SPD) * (speed / STALL_SPD)
+    : 1;
+
+  const thrust = throttle * MAX_THR;
+  const lift   = speed * LIFT_K * liftFactor;
+  const drag   = speed * speed * DRAG_K;
+
+  _dragDir.copy(planeVel).normalize().multiplyScalar(-drag);
+
+  _acc.set(0, -GRAVITY, 0);
+  _acc.addScaledVector(_fwd, thrust);
+  _acc.addScaledVector(_up,  lift);
+  _acc.add(_dragDir);
+
+  planeVel.addScaledVector(_acc, dt);
+  planeVel.clampLength(0, 300);
+
+  planePos.addScaledVector(planeVel, dt);
+
+  // Ground collision
+  const gnd = terrainY(planePos.x, planePos.z) + 2;
+  if (planePos.y < gnd) {
+    crashed = true;
+    crashBoom();
+    planePos.y = gnd;
+    planeVel.set(0, 0, 0);
+    $msg.innerHTML = 'CRASHED<br><span style="font-size:16px;color:#fff">Press R to restart</span>';
+    $msg.style.display = 'block';
+    return;
+  }
+
+  updateChunks(planePos.x, planePos.z);
+
+  planeGroup.position.copy(planePos);
+  planeGroup.quaternion.copy(planeQuat);
+
+  // HUD metrics
+  const gForce = (lift + GRAVITY) / GRAVITY;
+  const vspd   = (planePos.y - prevY) / dt;
+  prevY = planePos.y;
+  updateHUD(speed, gForce, vspd);
+  updateAudio(speed, throttle);
+
+  // Camera
+  if (camMode === 0) {
+    // Chase cam — smooth follow behind and slightly above
+    _camTgt.copy(planePos)
+      .addScaledVector(_fwd, -18)
+      .addScaledVector(_up, 5);
+    camPos.lerp(_camTgt, Math.min(1, dt * 7));
+    camLookAt.lerp(planePos, Math.min(1, dt * 9));
+    camera.position.copy(camPos);
+    camera.lookAt(camLookAt);
+  } else {
+    // Cockpit
+    camera.position.copy(planePos)
+      .addScaledVector(_fwd, 1.8)
+      .addScaledVector(_up, 0.3);
+    camera.quaternion.copy(planeQuat);
+  }
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Build initial terrain around spawn
+updateChunks(0, 0);
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  if (!lastT) { lastT = ts; return; }
+  const dt = Math.min((ts - lastT) / 1000, 0.05);
+  lastT = ts;
+  update(dt);
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
