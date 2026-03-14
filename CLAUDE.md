@@ -9,7 +9,7 @@ A retro arcade game collection built with vanilla HTML5 Canvas and JavaScript �
 ## Running the Games
 
 Open any HTML file directly in a browser. No build step or server required:
-- `index.html` — Wilbur Lander (lunar lander clone)
+- `wilbur-lander.html` — Wilbur Lander (lunar lander clone)
 - `asteroids.html` — Asteroids (2-player local)
 - `space-invaders.html` — Space Invaders
 - `tower-defense.html` — Tower Defense
@@ -47,7 +47,7 @@ Each game is a single HTML file with embedded CSS and JS, structured into clear 
 
 ### Per-game notes
 
-- **Wilbur Lander** (`index.html`): Procedural terrain with interpolated 3-point collision detection for the lander footpads.
+- **Wilbur Lander** (`wilbur-lander.html`): Procedural terrain with interpolated 3-point collision detection for the lander footpads.
 - **Asteroids** (`asteroids.html`): Polygon-based asteroids with random vertex generation; per-ship invincibility frames after respawn. 2-player local co-op.
 - **Space Invaders** (`space-invaders.html`): Fixed 800×600 canvas; destructible shields stored as pixel bitmaps; march-beat audio driven by alien count.
 - **Tower Defense** (`tower-defense.html`): 22×13 tile grid; fixed enemy path; 5 tower types (Cannon, Sniper, Mortar, Frost, Laser); 4 enemy types with pixel-art sprites; homing projectiles with splash damage.
